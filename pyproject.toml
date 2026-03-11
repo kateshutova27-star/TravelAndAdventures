@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "travel-backend"
+version = "0.1.0"
+description = "FastAPI travel backend service"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "geoalchemy2>=0.15",
+    "alembic>=1.14",
+    "pydantic-settings>=2.7",
+    "redis[hiredis]>=5.2",
+    "arq>=0.26",
+    "httpx>=0.28",
+    "orjson>=3.10",
+    "slowapi>=0.1.9",
+    "structlog>=24.0",
+    "sentry-sdk[fastapi]>=2.0",
+    "polyline>=2.0",
+    "bleach>=6.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app", "scripts"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "coverage>=7.6",
+]
