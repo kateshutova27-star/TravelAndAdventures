@@ -35,6 +35,7 @@ async def generate_adventure_task(ctx: dict, adventure_id: str, params: dict) ->
                 lng=params["lng"],
                 duration=params["duration"],
                 categories=params.get("categories", []),
+                place_ids=params.get("place_ids", []),
                 update_status_fn=update_status,
             )
 

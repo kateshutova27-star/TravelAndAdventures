@@ -71,6 +71,7 @@ async def generate_adventure(
         "lng": body.lng,
         "duration": body.duration.value,
         "categories": [c.value for c in body.categories],
+        "place_ids": body.place_ids,
     }
 
     adventure = await adventure_service.create_adventure(db, device_id, params)

@@ -32,6 +32,7 @@ class GenerateAdventureRequest(CamelModel):
     lng: float = Field(ge=-180, le=180)
     duration: AdventureDuration
     categories: list[PlaceCategory] = []
+    place_ids: list[str] = []
 
 
 class GenerateAdventureResponse(CamelModel):

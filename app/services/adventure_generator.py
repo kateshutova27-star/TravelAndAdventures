@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.place import Place
-from app.services.place_service import find_nearby
+from app.services.place_service import find_nearby, get_place_by_id
 from app.services.route_optimizer import optimize_route
 from app.services.routing_service import LatLng, get_distance_matrix, get_walking_route
 from app.utils.geo import calculate_search_radius_km
@@ -183,6 +183,7 @@ async def generate_adventure(
     lng: float,
     duration: str,
     categories: list[str],
+    place_ids: list[str] | None = None,
     update_status_fn=None,
 ) -> dict:
     """Full adventure generation pipeline.
@@ -191,6 +192,14 @@ async def generate_adventure(
     """
     duration_minutes = DURATION_MINUTES.get(duration, 180)
     config = DURATION_CONFIGS.get(duration, DURATION_CONFIGS["threeHours"])
+
+    # Step 0: Load pinned places (from trip basket / "add to trip")
+    pinned_places: list[Place] = []
+    if place_ids:
+        for pid in place_ids:
+            place = await get_place_by_id(db, pid)
+            if place and place.is_active:
+                pinned_places.append(place)
 
     # Step 1: Calculate radius and find candidates
     if update_status_fn:
@@ -209,7 +218,7 @@ async def generate_adventure(
     if len(all_candidates) < config.min_stops:
         all_candidates = await find_nearby(db, lat, lng, radius_m=radius_m * 3, limit=100)
 
-    if len(all_candidates) < 2:
+    if len(all_candidates) < 2 and len(pinned_places) < 2:
         raise ValueError("Not enough places found nearby to generate an adventure")
 
     # Build candidates: prefer requested categories, but always include
@@ -227,7 +236,32 @@ async def generate_adventure(
     if update_status_fn:
         await update_status_fn("buildingRoute")
 
-    selected = select_stops(candidates, categories, config)
+    # Build pinned stops first — these are guaranteed in the adventure
+    pinned_ids = {p.id for p in pinned_places}
+    pinned_stops: list[SelectedStop] = []
+    for place in pinned_places:
+        compatible_slots = _get_compatible_slots(place.category)
+        slot_type = compatible_slots[0] if compatible_slots else "secondary"
+        dwell = DWELL_TIMES.get(slot_type, 15)
+        pinned_stops.append(SelectedStop(place=place, slot_type=slot_type, time_to_spend_minutes=dwell))
+
+    # Remove pinned places from candidates so they aren't selected twice
+    candidates = [c for c in candidates if c.id not in pinned_ids]
+
+    # Reduce target slots for auto-selection by the number of pinned stops
+    remaining_slots = max(0, config.target_stops - len(pinned_stops))
+    if remaining_slots > 0:
+        reduced_config = StopConfig(
+            target_stops=remaining_slots,
+            min_stops=max(0, config.min_stops - len(pinned_stops)),
+            slot_template=config.slot_template[:remaining_slots],
+            avg_time_per_stop=config.avg_time_per_stop,
+        )
+        auto_selected = select_stops(candidates, categories, reduced_config)
+    else:
+        auto_selected = []
+
+    selected = pinned_stops + auto_selected
 
     if len(selected) < 2:
         raise ValueError("Could not select enough stops for this adventure")
