@@ -18,6 +18,9 @@ class PlaceCategory(str, Enum):
     coffee = "coffee"
     restaurant = "restaurant"
     photo = "photo"
+    hike = "hike"
+    museum = "museum"
+    landmark = "landmark"
 
 
 class AdventureDuration(str, Enum):
@@ -27,8 +30,17 @@ class AdventureDuration(str, Enum):
     full_day = "fullDay"
 
 
+class SearchRadius(int, Enum):
+    km_5 = 5
+    km_10 = 10
+    km_15 = 15
+    km_20 = 20
+    km_50 = 50
+
+
 class GenerationStatus(str, Enum):
     pending = "pending"
+    loading_area = "loadingArea"
     finding_places = "findingPlaces"
     building_route = "buildingRoute"
     completed = "completed"

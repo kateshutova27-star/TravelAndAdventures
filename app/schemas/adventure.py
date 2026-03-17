@@ -7,6 +7,7 @@ from app.schemas.common import (
     CamelModel,
     GenerationStatus,
     PlaceCategory,
+    SearchRadius,
 )
 from app.schemas.place import PlaceResponse
 
@@ -33,6 +34,9 @@ class GenerateAdventureRequest(CamelModel):
     duration: AdventureDuration
     categories: list[PlaceCategory] = []
     place_ids: list[str] = []
+    radius_km: SearchRadius | None = None
+    excluded_place_ids: list[str] = []
+    boosted_place_ids: list[str] = []
 
 
 class GenerateAdventureResponse(CamelModel):
@@ -42,6 +46,7 @@ class GenerateAdventureResponse(CamelModel):
 class AdventureStatusResponse(CamelModel):
     status: GenerationStatus
     adventure_id: str | None = Field(default=None, serialization_alias="adventure_id")
+    error_message: str | None = None
 
 
 class AdventureUpdateRequest(CamelModel):

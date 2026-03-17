@@ -2,27 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import math
-from dataclasses import dataclass, field
+import random
+from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.place import Place
 from app.services.place_service import find_nearby, get_place_by_id
+from app.services.poi_loader import _load_area, is_area_loaded
 from app.services.route_optimizer import optimize_route
-from app.services.routing_service import LatLng, get_distance_matrix, get_walking_route
-from app.utils.geo import calculate_search_radius_km
+from app.services.routing_service import LatLng, RouteResult, get_distance_matrix, get_walking_route
+from app.utils.geo import calculate_search_radius_km, haversine
 
 logger = logging.getLogger(__name__)
 
 
-# Duration enum value -> minutes
+# Duration enum value -> time budget in minutes (synced with Flutter client)
 DURATION_MINUTES: dict[str, int] = {
     "oneHour": 60,
     "threeHours": 180,
-    "halfDay": 360,
-    "fullDay": 720,
+    "halfDay": 300,
+    "fullDay": 480,
 }
 
 
@@ -30,136 +32,208 @@ DURATION_MINUTES: dict[str, int] = {
 class StopConfig:
     target_stops: int
     min_stops: int
-    slot_template: list[str]
     avg_time_per_stop: int
 
 
 DURATION_CONFIGS: dict[str, StopConfig] = {
-    "oneHour": StopConfig(
-        target_stops=3, min_stops=2,
-        slot_template=["wow_spot", "food_coffee", "secondary"],
-        avg_time_per_stop=12,
-    ),
-    "threeHours": StopConfig(
-        target_stops=5, min_stops=4,
-        slot_template=["wow_spot", "food_coffee", "secondary", "viewpoint", "secondary"],
-        avg_time_per_stop=18,
-    ),
-    "halfDay": StopConfig(
-        target_stops=7, min_stops=5,
-        slot_template=["wow_spot", "food_coffee", "secondary", "viewpoint", "secondary", "food_coffee", "secondary"],
-        avg_time_per_stop=25,
-    ),
-    "fullDay": StopConfig(
-        target_stops=10, min_stops=7,
-        slot_template=[
-            "wow_spot", "food_coffee", "secondary", "viewpoint", "secondary",
-            "food_coffee", "secondary", "viewpoint", "secondary", "food_coffee",
-        ],
-        avg_time_per_stop=30,
-    ),
+    "oneHour": StopConfig(target_stops=3, min_stops=1, avg_time_per_stop=15),
+    "threeHours": StopConfig(target_stops=5, min_stops=2, avg_time_per_stop=18),
+    "halfDay": StopConfig(target_stops=7, min_stops=3, avg_time_per_stop=25),
+    "fullDay": StopConfig(target_stops=10, min_stops=4, avg_time_per_stop=30),
 }
 
-# Which slot types each place category can fill
-CATEGORY_SLOT_MAP: dict[str, list[str]] = {
-    "nature": ["wow_spot", "secondary", "viewpoint"],
-    "city": ["wow_spot", "secondary"],
-    "coffee": ["food_coffee"],
-    "restaurant": ["food_coffee"],
-    "photo": ["viewpoint", "secondary"],
+
+# ── Category-aware visit durations (synced with Flutter visit_duration.dart) ──
+
+# Base visit duration per category in minutes
+_BASE_VISIT_DURATION: dict[str, int] = {
+    "coffee": 30,
+    "restaurant": 60,
+    "photo": 8,
+    "city": 45,
+    "nature": 40,
+    "hike": 120,
+    "museum": 150,
+    "landmark": 20,
 }
 
-# Default dwell times per slot type
-DWELL_TIMES: dict[str, int] = {
-    "wow_spot": 30,
-    "secondary": 15,
-    "food_coffee": 20,
-    "viewpoint": 10,
+# Hard minimum per category
+_MIN_VISIT_DURATION: dict[str, int] = {
+    "coffee": 15,
+    "restaurant": 30,
+    "photo": 5,
+    "city": 15,
+    "nature": 15,
+    "hike": 60,
+    "museum": 45,
+    "landmark": 10,
 }
+
+# Scale factors by trip duration
+_DURATION_SCALE: dict[str, float] = {
+    "oneHour": 0.6,
+    "threeHours": 1.0,
+    "halfDay": 1.15,
+    "fullDay": 1.3,
+}
+
+
+def get_visit_duration(category: str, duration: str) -> int:
+    """Return recommended visit time in minutes, scaled by trip duration."""
+    base = _BASE_VISIT_DURATION.get(category, 20)
+    scale = _DURATION_SCALE.get(duration, 1.0)
+    minimum = _MIN_VISIT_DURATION.get(category, 5)
+    scaled = round(base * scale)
+    return max(minimum, min(scaled, base * 2))
 
 
 @dataclass
 class SelectedStop:
     place: Place
-    slot_type: str
     time_to_spend_minutes: int = 0
     drive_time_minutes: float = 0
     order: int = 0
 
 
-def _compute_score(place: Place, requested_categories: list[str]) -> float:
-    """Score a candidate place for selection."""
-    score = 0.0
-    # Rating component (0-5 -> 0-1, weight 40%)
-    score += (place.rating or 3.0) / 5.0 * 0.4
-    # Category match (weight 30%)
-    if place.category in requested_categories:
-        score += 0.3
-    # Popularity via review count (weight 15%)
-    review_score = min(math.log10(max(place.review_count or 1, 1)) / 4.0, 1.0)
-    score += review_score * 0.15
-    # Base uniqueness bonus (weight 15%)
-    score += 0.1
+def _compute_score(
+    place: Place,
+    anchor_lat: float,
+    anchor_lng: float,
+    max_radius_m: float,
+    is_boosted: bool = False,
+) -> float:
+    """Score a candidate place (synced with Flutter AdventureBuilder).
+
+    Scoring: rating 60%, proximity 30%, small jitter 10% for variety.
+    Boosted (liked) places get a 15% score boost.
+    """
+    # Rating component (0-5 -> 0-1, weight 60%)
+    rating_score = (place.rating or 3.0) / 5.0
+
+    # Proximity component (weight 30%)
+    dist = haversine(anchor_lat, anchor_lng, place.lat, place.lng)
+    norm_dist = min(dist / max(max_radius_m, 1.0), 1.0)
+    proximity_score = 1.0 - norm_dist
+
+    # Small jitter for variety between regenerations (weight 10%)
+    jitter = random.uniform(0, 1.0)
+
+    score = rating_score * 0.6 + proximity_score * 0.3 + jitter * 0.1
+
+    if is_boosted:
+        score = min(1.0, score * 1.15)
+
     return score
 
 
-def _get_compatible_slots(category: str) -> list[str]:
-    return CATEGORY_SLOT_MAP.get(category, ["secondary"])
+def _greedy_select(
+    scored: list[tuple[Place, float]],
+    duration: str,
+    time_budget: int,
+    anchor_lat: float,
+    anchor_lng: float,
+    pinned_stops: list[SelectedStop] | None,
+    use_minimums: bool = False,
+) -> list[SelectedStop]:
+    """Inner greedy loop: pick stops within time budget.
+
+    If use_minimums=True, all visit times are set to the category minimum
+    (second-pass fallback for short trips).
+    """
+    selected: list[SelectedStop] = list(pinned_stops or [])
+    used_ids = {s.place.id for s in selected}
+    used_time = sum(s.time_to_spend_minutes for s in selected)
+
+    for place, _ in scored:
+        if place.id in used_ids:
+            continue
+
+        if use_minimums:
+            visit_time = _MIN_VISIT_DURATION.get(place.category, 5)
+        else:
+            visit_time = get_visit_duration(place.category, duration)
+
+        # Estimate walk time from last stop (haversine / 4.5 km/h)
+        if selected:
+            last = selected[-1].place
+            dist_m = haversine(last.lat, last.lng, place.lat, place.lng)
+        else:
+            dist_m = haversine(anchor_lat, anchor_lng, place.lat, place.lng)
+        walk_min = (dist_m / 1000) / 4.5 * 60
+
+        # Skip if single walk segment > 90 min (unless hike)
+        if walk_min > 90 and place.category != "hike":
+            continue
+
+        total_needed = walk_min + visit_time
+        if used_time + total_needed <= time_budget:
+            selected.append(SelectedStop(
+                place=place,
+                time_to_spend_minutes=visit_time,
+            ))
+            used_ids.add(place.id)
+            used_time += total_needed
+
+    return selected
 
 
 def select_stops(
     candidates: list[Place],
     categories: list[str],
-    config: StopConfig,
+    duration: str,
+    time_budget: int,
+    anchor_lat: float,
+    anchor_lng: float,
+    max_radius_m: float,
+    pinned_stops: list[SelectedStop] | None = None,
+    boosted_ids: set[str] | None = None,
 ) -> list[SelectedStop]:
-    """Select stops by greedily filling slot template with diversity constraint."""
-    # Score all candidates
-    scored = [(c, _compute_score(c, categories)) for c in candidates]
+    """Select stops greedily within time budget using category-aware durations.
 
-    # Bucket by compatible slot types, sorted by score desc
-    buckets: dict[str, list[tuple[Place, float]]] = {
-        "wow_spot": [], "secondary": [], "food_coffee": [], "viewpoint": [],
-    }
-    for place, score in scored:
-        for slot_type in _get_compatible_slots(place.category):
-            if slot_type in buckets:
-                buckets[slot_type].append((place, score))
+    Synced with Flutter AdventureBuilder: score by rating+proximity, pick
+    greedily by time budget, use category-specific visit durations.
+    Two-pass: first with normal durations, fallback with minimum durations.
+    """
+    _boosted = boosted_ids or set()
 
-    for bucket in buckets.values():
-        bucket.sort(key=lambda x: x[1], reverse=True)
+    # Filter by radius from anchor
+    in_radius = [
+        c for c in candidates
+        if haversine(anchor_lat, anchor_lng, c.lat, c.lng) <= max_radius_m
+    ]
 
-    # Fill slots greedily
-    selected: list[SelectedStop] = []
-    used_ids: set[str] = set()
-    last_category: str | None = None
+    # Score and sort by quality
+    scored = [
+        (c, _compute_score(c, anchor_lat, anchor_lng, max_radius_m, is_boosted=str(c.id) in _boosted))
+        for c in in_radius
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
 
-    for slot_type in config.slot_template:
-        best: Place | None = None
+    # First pass: normal durations
+    selected = _greedy_select(
+        scored, duration, time_budget, anchor_lat, anchor_lng, pinned_stops,
+    )
 
-        # First pass: respect diversity constraint
-        for place, _ in buckets.get(slot_type, []):
-            if place.id in used_ids:
-                continue
-            if place.category == last_category:
-                continue
-            best = place
-            break
+    pinned_count = len(pinned_stops or [])
 
-        # Second pass: relax diversity
-        if best is None:
-            for place, _ in buckets.get(slot_type, []):
-                if place.id not in used_ids:
-                    best = place
-                    break
+    # Second pass: if not enough new stops, retry with minimum durations
+    if len(selected) - pinned_count < 2 and scored:
+        selected2 = _greedy_select(
+            scored, duration, time_budget, anchor_lat, anchor_lng,
+            pinned_stops, use_minimums=True,
+        )
+        if len(selected2) > len(selected):
+            selected = selected2
 
-        if best is None:
-            continue
-
-        used_ids.add(best.id)
-        last_category = best.category
-
-        dwell = DWELL_TIMES.get(slot_type, 15)
-        selected.append(SelectedStop(place=best, slot_type=slot_type, time_to_spend_minutes=dwell))
+    # Edge case: if nothing was added but candidates exist, add the best one
+    if len(selected) == pinned_count and scored:
+        best_place = scored[0][0]
+        used_ids = {s.place.id for s in selected}
+        if best_place.id not in used_ids:
+            selected.append(SelectedStop(
+                place=best_place,
+                time_to_spend_minutes=_MIN_VISIT_DURATION.get(best_place.category, 5),
+            ))
 
     return selected
 
@@ -184,11 +258,16 @@ async def generate_adventure(
     duration: str,
     categories: list[str],
     place_ids: list[str] | None = None,
+    radius_km: int | None = None,
+    excluded_place_ids: list[str] | None = None,
+    boosted_place_ids: list[str] | None = None,
+    redis=None,
     update_status_fn=None,
 ) -> dict:
     """Full adventure generation pipeline.
 
     Returns dict with: stops, total_time_minutes, drive_time_minutes, encoded_polyline.
+    Algorithm synced with Flutter AdventureBuilder.
     """
     duration_minutes = DURATION_MINUTES.get(duration, 180)
     config = DURATION_CONFIGS.get(duration, DURATION_CONFIGS["threeHours"])
@@ -201,116 +280,273 @@ async def generate_adventure(
             if place and place.is_active:
                 pinned_places.append(place)
 
-    # Step 1: Calculate radius and find candidates
+    # Step 1: Determine anchor (synced with Flutter: highest-rated basket place)
+    anchor_lat, anchor_lng = lat, lng
+    if pinned_places:
+        # Sort by rating desc, tie-break by distance to user
+        pinned_places.sort(key=lambda p: (
+            -(p.rating or 0),
+            haversine(lat, lng, p.lat, p.lng),
+        ))
+        anchor_lat = pinned_places[0].lat
+        anchor_lng = pinned_places[0].lng
+
+    # Step 2: Calculate radius and find candidates
+    if radius_km is not None:
+        search_radius_km = float(radius_km)
+    else:
+        search_radius_km = calculate_search_radius_km(
+            duration_minutes, config.target_stops, config.avg_time_per_stop
+        )
+    radius_m = search_radius_km * 1000
+
+    # Filter pinned places by radius from anchor (far ones stay in basket)
+    included_pinned: list[Place] = []
+    if pinned_places:
+        included_pinned.append(pinned_places[0])  # anchor always included
+        for p in pinned_places[1:]:
+            if haversine(anchor_lat, anchor_lng, p.lat, p.lng) <= radius_m:
+                included_pinned.append(p)
+
+    # DB-first: try existing data before hitting Overpass API
     if update_status_fn:
         await update_status_fn("findingPlaces")
 
-    radius_km = calculate_search_radius_km(
-        duration_minutes, config.target_stops, config.avg_time_per_stop
-    )
-    radius_m = radius_km * 1000
+    all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m, limit=100)
 
-    all_candidates = await find_nearby(db, lat, lng, radius_m=radius_m, limit=100)
+    # Only fetch from Overpass if not enough candidates in DB
+    bg_load_task = None
+    if len(all_candidates) < config.min_stops and redis is not None:
+        if update_status_fn:
+            await update_status_fn("loadingArea")
 
-    # Expand radius if not enough candidates overall
+        core_radius = min(search_radius_km, 1.0)
+        await _load_area(
+            db, redis, anchor_lat, anchor_lng,
+            radius_km=core_radius,
+            categories=categories if categories else None,
+        )
+        all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m, limit=100)
+
+        # Still not enough? Try a wider Overpass fetch
+        if len(all_candidates) < config.min_stops:
+            await _load_area(
+                db, redis, anchor_lat, anchor_lng,
+                radius_km=min(search_radius_km, 2.0),
+                categories=categories if categories else None,
+            )
+            all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m, limit=100)
+
+    # Background: load full radius for future requests
+    if redis is not None:
+        if not await is_area_loaded(redis, anchor_lat, anchor_lng, search_radius_km):
+            bg_load_task = asyncio.create_task(
+                _load_area(
+                    db, redis, anchor_lat, anchor_lng,
+                    radius_km=search_radius_km,
+                    categories=categories if categories else None,
+                )
+            )
+
+    if update_status_fn:
+        await update_status_fn("findingPlaces")
+
+    # Expand radius from DB if still not enough
     if len(all_candidates) < config.min_stops:
-        all_candidates = await find_nearby(db, lat, lng, radius_m=radius_m * 2, limit=100)
+        all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m * 2, limit=100)
     if len(all_candidates) < config.min_stops:
-        all_candidates = await find_nearby(db, lat, lng, radius_m=radius_m * 3, limit=100)
+        all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m * 3, limit=100)
 
-    if len(all_candidates) < 2 and len(pinned_places) < 2:
+    # Filter out excluded places (disliked, recently visited)
+    excluded_set = set(excluded_place_ids or [])
+    boosted_set = set(boosted_place_ids or [])
+    if excluded_set:
+        all_candidates = [c for c in all_candidates if str(c.id) not in excluded_set]
+
+    if len(all_candidates) < 1 and len(included_pinned) < 1:
         raise ValueError("Not enough places found nearby to generate an adventure")
 
-    # Build candidates: prefer requested categories, but always include
-    # enough variety to fill all slot types in the template.
+    # Step 3: Strict category filtering (synced with Flutter — no padding)
     if categories:
-        preferred = [c for c in all_candidates if c.category in categories]
-        others = [c for c in all_candidates if c.category not in categories]
-        # Always include non-category places so slot types like wow_spot /
-        # secondary / viewpoint can be filled even when user picks only coffee.
-        candidates = preferred + others
+        candidates = [c for c in all_candidates if c.category in categories]
+        # Fallback: if strict filtering leaves too few, use all
+        if len(candidates) < config.min_stops:
+            candidates = all_candidates
     else:
         candidates = all_candidates
 
-    # Step 2: Select stops
+    # Step 4: Select stops using greedy time-budget algorithm
     if update_status_fn:
         await update_status_fn("buildingRoute")
 
-    # Build pinned stops first — these are guaranteed in the adventure
-    pinned_ids = {p.id for p in pinned_places}
+    # Build pinned stops with category-aware visit durations
+    pinned_ids = {p.id for p in included_pinned}
     pinned_stops: list[SelectedStop] = []
-    for place in pinned_places:
-        compatible_slots = _get_compatible_slots(place.category)
-        slot_type = compatible_slots[0] if compatible_slots else "secondary"
-        dwell = DWELL_TIMES.get(slot_type, 15)
-        pinned_stops.append(SelectedStop(place=place, slot_type=slot_type, time_to_spend_minutes=dwell))
+    for place in included_pinned:
+        dwell = get_visit_duration(place.category, duration)
+        pinned_stops.append(SelectedStop(place=place, time_to_spend_minutes=dwell))
 
-    # Remove pinned places from candidates so they aren't selected twice
+    # Remove pinned places from candidates
     candidates = [c for c in candidates if c.id not in pinned_ids]
 
-    # Reduce target slots for auto-selection by the number of pinned stops
-    remaining_slots = max(0, config.target_stops - len(pinned_stops))
-    if remaining_slots > 0:
-        reduced_config = StopConfig(
-            target_stops=remaining_slots,
-            min_stops=max(0, config.min_stops - len(pinned_stops)),
-            slot_template=config.slot_template[:remaining_slots],
-            avg_time_per_stop=config.avg_time_per_stop,
-        )
-        auto_selected = select_stops(candidates, categories, reduced_config)
-    else:
-        auto_selected = []
+    selected = select_stops(
+        candidates=candidates,
+        categories=categories,
+        duration=duration,
+        time_budget=duration_minutes,
+        anchor_lat=anchor_lat,
+        anchor_lng=anchor_lng,
+        max_radius_m=radius_m,
+        pinned_stops=pinned_stops,
+        boosted_ids=boosted_set,
+    )
 
-    selected = pinned_stops + auto_selected
-
-    if len(selected) < 2:
+    if len(selected) < 1:
         raise ValueError("Could not select enough stops for this adventure")
 
-    # Step 3: Get distance matrix and optimize route
-    all_points = [LatLng(lat, lng)] + [LatLng(s.place.lat, s.place.lng) for s in selected]
+    # Step 5: Get distance matrix, optimize route, validate time budget
+    async def _build_route(stops: list[SelectedStop]) -> tuple[list[SelectedStop], RouteResult]:
+        """Optimize stop order and get walking route."""
+        pts = [LatLng(s.place.lat, s.place.lng) for s in stops]
+        mat = await get_distance_matrix(pts)
+        order = optimize_route(mat, start_idx=0)
+        ordered = [stops[0]] + [stops[i] for i in order]
+        wps = [LatLng(s.place.lat, s.place.lng) for s in ordered]
+        rt = await get_walking_route(wps)
+        # Assign walk times
+        for i, stop in enumerate(ordered):
+            if i > 0 and (i - 1) < len(rt.leg_times):
+                stop.drive_time_minutes = rt.leg_times[i - 1].time_seconds / 60.0
+            else:
+                stop.drive_time_minutes = 0
+            stop.order = i + 1
+        return ordered, rt
 
-    matrix = await get_distance_matrix(all_points)
-    optimized_order = optimize_route(matrix, start_idx=0)
+    # Single-stop adventure: skip routing API (Geoapify needs 2+ waypoints)
+    if len(selected) == 1:
+        selected[0].order = 1
+        selected[0].drive_time_minutes = 0
+        total_dwell = selected[0].time_to_spend_minutes
 
-    # Reorder stops: optimized_order contains indices into all_points[1:], so offset by -1
-    selected = [selected[i - 1] for i in optimized_order]
+        if bg_load_task is not None:
+            try:
+                await bg_load_task
+            except Exception:
+                logger.warning("Background full-radius load failed (non-critical)")
 
-    # Step 4: Get walking route
-    waypoints = [LatLng(lat, lng)] + [LatLng(s.place.lat, s.place.lng) for s in selected]
-    route = await get_walking_route(waypoints)
+        return {
+            "stops": [{
+                "place_id": selected[0].place.id,
+                "order": 1,
+                "drive_time_minutes": 0,
+                "time_to_spend_minutes": selected[0].time_to_spend_minutes,
+            }],
+            "total_time_minutes": total_dwell,
+            "drive_time_minutes": 0,
+            "encoded_polyline": "",
+        }
 
-    # Assign drive times from route legs
-    for i, stop in enumerate(selected):
-        if i < len(route.leg_times):
-            stop.drive_time_minutes = route.leg_times[i].time_seconds / 60.0
-        stop.order = i + 1
+    selected, route = await _build_route(selected)
 
-    # Step 5: Validate time budget (up to 3 iterations)
-    for _ in range(3):
+    # Step 6: Validate time budget — trim dwell, remove stops with long legs
+    max_iterations = len(selected) + 3
+    for _ in range(max_iterations):
         if _validate_time_budget(selected, route.total_time_seconds, duration_minutes):
             break
 
-        # Strategy 1: trim dwell times proportionally
         total_dwell = sum(s.time_to_spend_minutes for s in selected)
-        overshoot = (total_dwell + route.total_time_seconds / 60.0) - duration_minutes
-        if overshoot > 0 and overshoot < total_dwell * 0.3:
-            scale = (total_dwell - overshoot) / total_dwell
-            for stop in selected:
-                stop.time_to_spend_minutes = max(5, int(stop.time_to_spend_minutes * scale))
+        total_travel_min = route.total_time_seconds / 60.0
+        overshoot = (total_dwell + total_travel_min) - duration_minutes
+
+        # Find the leg with the longest walk time
+        max_leg_time = 0
+        max_leg_stop_idx = -1
+        for i, stop in enumerate(selected):
+            if stop.drive_time_minutes > max_leg_time:
+                max_leg_time = stop.drive_time_minutes
+                max_leg_stop_idx = i
+
+        # Max acceptable leg time: travel budget / number of legs
+        travel_budget = duration_minutes - total_dwell
+        num_legs = max(len(selected) - 1, 1)
+        max_acceptable_leg = max(travel_budget / num_legs * 1.5, 15)
+
+        # Strategy 1: if there's a leg way too long, remove that stop and rebuild
+        if max_leg_time > max_acceptable_leg and len(selected) > 2:
+            removed = selected.pop(max_leg_stop_idx)
+            logger.info(
+                "Removing stop %s (leg %.0f min > max %.0f min)",
+                removed.place.name, max_leg_time, max_acceptable_leg,
+            )
+            selected, route = await _build_route(selected)
             continue
 
-        # Strategy 2: remove weakest optional stop
-        optional = [s for s in selected if s.slot_type in ("viewpoint", "secondary")]
-        if optional:
-            weakest = min(optional, key=lambda s: _compute_score(s.place, categories))
+        # Strategy 1b: only 2 stops but walk leg is absurdly long — drop
+        # the non-pinned stop to produce a single-stop adventure
+        if max_leg_time > max_acceptable_leg and len(selected) == 2:
+            pinned_id_set = {p.id for p in included_pinned}
+            non_pinned = [i for i, s in enumerate(selected) if s.place.id not in pinned_id_set]
+            if non_pinned:
+                removed = selected.pop(non_pinned[0])
+                logger.info(
+                    "Dropping non-pinned stop %s (leg %.0f min too long for 2-stop route)",
+                    removed.place.name, max_leg_time,
+                )
+                # Fall through to single-stop return below
+                break
+
+        # Strategy 2: trim dwell times proportionally (respect category minimums)
+        if overshoot > 0 and overshoot <= total_dwell * 0.5:
+            scale = (total_dwell - overshoot) / total_dwell
+            for stop in selected:
+                minimum = _MIN_VISIT_DURATION.get(stop.place.category, 5)
+                stop.time_to_spend_minutes = max(minimum, int(stop.time_to_spend_minutes * scale))
+            continue
+
+        # Strategy 3: remove the weakest non-pinned stop and rebuild
+        if len(selected) > 2:
+            pinned_id_set = {p.id for p in included_pinned}
+            removable = [s for s in selected if s.place.id not in pinned_id_set]
+            if not removable:
+                removable = list(selected)
+            weakest = min(
+                removable,
+                key=lambda s: _compute_score(s.place, anchor_lat, anchor_lng, radius_m),
+            )
             selected.remove(weakest)
-            # Rebuild route with fewer stops
-            waypoints = [LatLng(lat, lng)] + [LatLng(s.place.lat, s.place.lng) for s in selected]
-            route = await get_walking_route(waypoints)
-            for i, stop in enumerate(selected):
-                if i < len(route.leg_times):
-                    stop.drive_time_minutes = route.leg_times[i].time_seconds / 60.0
-                stop.order = i + 1
+            selected, route = await _build_route(selected)
+            continue
+
+        # Strategy 4: only 2 stops left, trim to minimums
+        if overshoot > 0:
+            for stop in selected:
+                minimum = _MIN_VISIT_DURATION.get(stop.place.category, 5)
+                stop.time_to_spend_minutes = minimum
+            break
+
+    # If trimming reduced to 1 stop, return as single-stop adventure
+    if len(selected) == 1:
+        selected[0].order = 1
+        selected[0].drive_time_minutes = 0
+        total_dwell = selected[0].time_to_spend_minutes
+
+        if bg_load_task is not None:
+            try:
+                await bg_load_task
+            except Exception:
+                logger.warning("Background full-radius load failed (non-critical)")
+
+        return {
+            "stops": [{
+                "place_id": selected[0].place.id,
+                "order": 1,
+                "drive_time_minutes": 0,
+                "time_to_spend_minutes": selected[0].time_to_spend_minutes,
+            }],
+            "total_time_minutes": total_dwell,
+            "drive_time_minutes": 0,
+            "encoded_polyline": "",
+        }
 
     # Build result
     total_dwell = sum(s.time_to_spend_minutes for s in selected)
@@ -325,6 +561,13 @@ async def generate_adventure(
         }
         for s in selected
     ]
+
+    # Wait for background full-radius load to finish (fire-and-forget cleanup)
+    if bg_load_task is not None:
+        try:
+            await bg_load_task
+        except Exception:
+            logger.warning("Background full-radius load failed (non-critical)")
 
     return {
         "stops": stops_data,

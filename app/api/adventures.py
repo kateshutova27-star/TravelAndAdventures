@@ -1,9 +1,13 @@
 """Adventures API endpoints."""
 
+import logging
+
 from arq.connections import ArqRedis
 from fastapi import APIRouter, Depends, HTTPException
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 from app.dependencies import get_db, get_device_id, get_redis
 from app.schemas.adventure import (
@@ -21,6 +25,14 @@ from app.services import adventure_service
 router = APIRouter()
 
 
+def _safe_category(category: str) -> PlaceCategory:
+    try:
+        return PlaceCategory(category)
+    except ValueError:
+        logger.warning("Unknown category '%s', falling back to landmark", category)
+        return PlaceCategory.landmark
+
+
 def _adventure_to_response(adventure) -> AdventureResponse:
     stops = []
     for stop in (adventure.stops or []):
@@ -29,7 +41,7 @@ def _adventure_to_response(adventure) -> AdventureResponse:
             place=PlaceResponse(
                 id=str(place.id),
                 name=place.name,
-                category=PlaceCategory(place.category),
+                category=_safe_category(place.category),
                 lat=place.lat,
                 lng=place.lng,
                 thumbnail_url=place.thumbnail_url,
@@ -72,6 +84,9 @@ async def generate_adventure(
         "duration": body.duration.value,
         "categories": [c.value for c in body.categories],
         "place_ids": body.place_ids,
+        "radius_km": body.radius_km.value if body.radius_km else None,
+        "excluded_place_ids": body.excluded_place_ids,
+        "boosted_place_ids": body.boosted_place_ids,
     }
 
     adventure = await adventure_service.create_adventure(db, device_id, params)
@@ -110,11 +125,12 @@ async def get_adventure_status(
     if progress:
         status_str = progress.get("status", "pending")
         adv_id = progress.get("adventure_id")
+        error_msg = progress.get("error")
         try:
             status = GenerationStatus(status_str)
         except ValueError:
             status = GenerationStatus.pending
-        return AdventureStatusResponse(status=status, adventure_id=adv_id)
+        return AdventureStatusResponse(status=status, adventure_id=adv_id, error_message=error_msg)
 
     # Fallback to DB
     adventure = await adventure_service.get_adventure(db, adventure_id)
@@ -127,7 +143,8 @@ async def get_adventure_status(
         status = GenerationStatus.pending
 
     adv_id = str(adventure.id) if adventure.status == "completed" else None
-    return AdventureStatusResponse(status=status, adventure_id=adv_id)
+    error_msg = adventure.error_message if adventure.status == "failed" else None
+    return AdventureStatusResponse(status=status, adventure_id=adv_id, error_message=error_msg)
 
 
 @router.get("/{adventure_id}", response_model=AdventureResponse)
@@ -185,6 +202,17 @@ async def update_adventure(
     await redis.delete(f"adventure:{adventure_id}")
 
     return _adventure_to_response(updated)
+
+
+@router.get("/{adventure_id}/saved")
+async def is_adventure_saved(
+    adventure_id: str,
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Check if an adventure is saved by the current device."""
+    saved = await adventure_service.is_adventure_saved(db, device_id, adventure_id)
+    return {"saved": saved}
 
 
 @router.post("/{adventure_id}/save", status_code=204)

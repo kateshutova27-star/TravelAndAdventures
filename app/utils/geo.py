@@ -26,5 +26,5 @@ def calculate_search_radius_km(duration_minutes: int, target_stops: int, avg_sto
         return 0.5
 
     total_travel_km = (travel_budget_min / 60) * WALKING_SPEED_KMH
-    radius_km = total_travel_km * 0.4 * BUFFER_FACTOR
+    radius_km = total_travel_km * 0.5
     return max(2.0, min(radius_km, 25.0))

@@ -31,7 +31,7 @@ async def cache_get(redis: Redis, key: str) -> Any | None:
     return json.loads(data)
 
 
-async def cache_set(redis: Redis, key: str, value: Any, ttl: int = 300) -> None:
+async def cache_set(redis: Redis, key: str, value: Any, ttl: int = 1_209_600) -> None:
     """Set a value in Redis cache as JSON."""
     await redis.set(key, json.dumps(value, default=str), ex=ttl)
 

@@ -135,6 +135,16 @@ async def get_saved_adventures(
     return list(result.scalars().all())
 
 
+async def is_adventure_saved(db: AsyncSession, device_id: str, adventure_id: str) -> bool:
+    """Check if an adventure is saved by a device."""
+    stmt = select(SavedAdventure).where(
+        SavedAdventure.device_id == device_id,
+        SavedAdventure.adventure_id == adventure_id,
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none() is not None
+
+
 async def save_adventure(db: AsyncSession, device_id: str, adventure_id: str) -> None:
     """Save an adventure for a device. Idempotent."""
     from sqlalchemy.dialects.postgresql import insert as pg_insert

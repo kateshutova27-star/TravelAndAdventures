@@ -19,6 +19,9 @@ CATEGORY_MAP = {
     "coffee": "food",
     "restaurant": "food",
     "photo": "travel",
+    "hike": "nature",
+    "museum": "buildings",
+    "landmark": "buildings",
 }
 
 

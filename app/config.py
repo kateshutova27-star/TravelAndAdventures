@@ -34,9 +34,12 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: list[str] = ["*"]
 
+    # Cache
+    PLACES_CACHE_TTL: int = 1_209_600  # 2 weeks in seconds
+
     # Worker
     ARQ_MAX_JOBS: int = 10
-    ARQ_JOB_TIMEOUT: int = 60
+    ARQ_JOB_TIMEOUT: int = 180
 
     @property
     def cors_origins(self) -> list[str]:

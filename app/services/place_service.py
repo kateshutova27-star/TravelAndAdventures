@@ -25,7 +25,13 @@ async def find_nearby(
     category: str | None = None,
     limit: int = 50,
 ) -> list[Place]:
-    """Find active places within radius_m meters of (lat, lng), ordered by distance."""
+    """Find active places within radius_m meters of (lat, lng).
+
+    Sort by rating (best first) rather than pure distance so that
+    high-quality spots further away (e.g. mountain trails at 30 km)
+    are not pushed out by mediocre nearby places.  Distance is already
+    bounded by the ST_DWithin filter.
+    """
     ref = _ref_geog(lng, lat)
 
     stmt = (
@@ -40,7 +46,7 @@ async def find_nearby(
     if category:
         stmt = stmt.where(Place.category == category)
 
-    stmt = stmt.order_by("distance_m").limit(limit)
+    stmt = stmt.order_by(Place.rating.desc().nullslast()).limit(limit)
 
     result = await db.execute(stmt)
     return [row.Place for row in result.all()]
@@ -52,7 +58,7 @@ async def search_places(
     lat: float | None = None,
     lng: float | None = None,
     radius_m: float = 50_000,
-    limit: int = 20,
+    limit: int = 50,
 ) -> list[Place]:
     """Search places by name using trigram similarity."""
     stmt = (

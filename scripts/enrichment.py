@@ -97,6 +97,9 @@ def _infer_best_time(category: str) -> str | None:
         "city": "morning or late afternoon",
         "coffee": "morning",
         "restaurant": "evening",
+        "hike": "early morning",
+        "museum": "morning or early afternoon",
+        "landmark": "morning or late afternoon",
     }
     return mapping.get(category)
 
