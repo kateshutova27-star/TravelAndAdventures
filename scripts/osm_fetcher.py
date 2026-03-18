@@ -165,7 +165,7 @@ async def _post_with_mirrors(
     last_err = None
     for url in OVERPASS_MIRRORS:
         try:
-            resp = await client.post(url, data={"data": query}, timeout=60)
+            resp = await client.post(url, data={"data": query}, timeout=25)
             resp.raise_for_status()
             return resp.json()
         except (httpx.HTTPError, httpx.TimeoutException) as e:
@@ -181,7 +181,7 @@ async def fetch_category(
 ) -> list[dict]:
     """Fetch POI elements from Overpass API for a single category."""
     body_clauses = CATEGORY_QUERIES[category].format(bbox=bbox.to_str())
-    query = f"[out:json][timeout:60];({body_clauses});out center tags;"
+    query = f"[out:json][timeout:25];({body_clauses});out center tags;"
 
     logger.info("Fetching %s for bbox %s", category, bbox.to_str())
     data = await _post_with_mirrors(client, query)
@@ -206,7 +206,7 @@ async def fetch_all_combined(
         if cat in CATEGORY_QUERIES:
             all_clauses += CATEGORY_QUERIES[cat].format(bbox=bbox.to_str())
 
-    query = f"[out:json][timeout:60];({all_clauses});out center tags;"
+    query = f"[out:json][timeout:25];({all_clauses});out center tags;"
     logger.info("Fetching %d categories combined for bbox %s", len(to_fetch), bbox.to_str())
 
     async with httpx.AsyncClient() as client:

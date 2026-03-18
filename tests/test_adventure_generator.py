@@ -262,10 +262,12 @@ class TestSelectStops:
         )
 
     def test_min_visit_durations_fit_one_hour(self):
-        """All category minimums should be under 30 min for oneHour to work."""
+        """Category minimums for oneHour-eligible categories should be reasonable."""
         from app.services.adventure_generator import _MIN_VISIT_DURATION
+        # Categories that are blocked for oneHour (limit=0) can have higher minimums
+        blocked_for_one_hour = {"hike", "museum", "restaurant"}
         for cat, minimum in _MIN_VISIT_DURATION.items():
-            if cat in ("hike", "museum"):  # these are naturally long
+            if cat in blocked_for_one_hour:
                 continue
             assert minimum <= 30, (
                 f"Category {cat} minimum {minimum} too high for oneHour trips"
@@ -293,3 +295,60 @@ class TestSelectStops:
             for _ in range(50)
         ]
         assert sum(boosted_scores) / len(boosted_scores) > sum(normal_scores) / len(normal_scores)
+
+
+class TestCategoryLimits:
+    """Tests for per-category stop limits."""
+
+    def _select(self, *, candidates=None, duration="fullDay", categories=None, **kw):
+        if candidates is None:
+            candidates = _make_candidates(30)
+        return select_stops(
+            candidates=candidates,
+            categories=categories or [],
+            duration=duration,
+            time_budget=DURATION_MINUTES[duration],
+            anchor_lat=49.28,
+            anchor_lng=-123.12,
+            max_radius_m=50000,
+            **kw,
+        )
+
+    def test_max_one_coffee_three_hours(self):
+        """threeHours should have at most 1 coffee stop."""
+        # Create candidates with many coffee shops
+        candidates = [_make_place(category="coffee", lat=49.28 + i * 0.001, lng=-123.12) for i in range(10)]
+        candidates += [_make_place(category="city", lat=49.28 + i * 0.001, lng=-123.11) for i in range(10)]
+        selected = self._select(candidates=candidates, duration="threeHours", categories=["coffee", "city"])
+        coffee_count = sum(1 for s in selected if s.place.category == "coffee")
+        assert coffee_count <= 1, f"Expected max 1 coffee for threeHours, got {coffee_count}"
+
+    def test_max_two_coffee_full_day(self):
+        """fullDay should have at most 2 coffee stops."""
+        candidates = [_make_place(category="coffee", lat=49.28 + i * 0.001, lng=-123.12) for i in range(10)]
+        candidates += [_make_place(category="city", lat=49.28 + i * 0.001, lng=-123.11) for i in range(10)]
+        selected = self._select(candidates=candidates, duration="fullDay", categories=["coffee", "city"])
+        coffee_count = sum(1 for s in selected if s.place.category == "coffee")
+        assert coffee_count <= 2, f"Expected max 2 coffee for fullDay, got {coffee_count}"
+
+    def test_no_restaurant_one_hour(self):
+        """oneHour with mixed categories should not include restaurant."""
+        candidates = [_make_place(category="restaurant", lat=49.28 + i * 0.001, lng=-123.12) for i in range(5)]
+        candidates += [_make_place(category="coffee", lat=49.28 + i * 0.001, lng=-123.11) for i in range(5)]
+        selected = self._select(candidates=candidates, duration="oneHour", categories=["restaurant", "coffee"])
+        restaurant_count = sum(1 for s in selected if s.place.category == "restaurant")
+        assert restaurant_count == 0, f"oneHour with mixed categories should have 0 restaurants, got {restaurant_count}"
+
+    def test_restaurant_allowed_if_only_category(self):
+        """oneHour with ONLY restaurant should allow 1."""
+        candidates = [_make_place(category="restaurant", lat=49.28 + i * 0.001, lng=-123.12) for i in range(5)]
+        selected = self._select(candidates=candidates, duration="oneHour", categories=["restaurant"])
+        restaurant_count = sum(1 for s in selected if s.place.category == "restaurant")
+        assert restaurant_count >= 1, "oneHour with only restaurant category should allow at least 1"
+
+    def test_unlimited_categories_not_capped(self):
+        """Categories without limits (nature, city, etc.) should not be capped."""
+        candidates = [_make_place(category="nature", lat=49.28 + i * 0.002, lng=-123.12) for i in range(15)]
+        selected = self._select(candidates=candidates, duration="fullDay", categories=["nature"])
+        nature_count = sum(1 for s in selected if s.place.category == "nature")
+        assert nature_count > 2, f"Nature should not be capped, got {nature_count}"

@@ -36,10 +36,10 @@ class StopConfig:
 
 
 DURATION_CONFIGS: dict[str, StopConfig] = {
-    "oneHour": StopConfig(target_stops=3, min_stops=1, avg_time_per_stop=15),
-    "threeHours": StopConfig(target_stops=5, min_stops=2, avg_time_per_stop=18),
-    "halfDay": StopConfig(target_stops=7, min_stops=3, avg_time_per_stop=25),
-    "fullDay": StopConfig(target_stops=10, min_stops=4, avg_time_per_stop=30),
+    "oneHour": StopConfig(target_stops=2, min_stops=1, avg_time_per_stop=20),
+    "threeHours": StopConfig(target_stops=4, min_stops=2, avg_time_per_stop=30),
+    "halfDay": StopConfig(target_stops=5, min_stops=2, avg_time_per_stop=35),
+    "fullDay": StopConfig(target_stops=8, min_stops=3, avg_time_per_stop=40),
 }
 
 
@@ -49,33 +49,59 @@ DURATION_CONFIGS: dict[str, StopConfig] = {
 _BASE_VISIT_DURATION: dict[str, int] = {
     "coffee": 30,
     "restaurant": 60,
-    "photo": 8,
-    "city": 45,
-    "nature": 40,
+    "photo": 15,
+    "city": 40,
+    "nature": 45,
     "hike": 120,
-    "museum": 150,
-    "landmark": 20,
+    "museum": 120,
+    "landmark": 25,
 }
 
 # Hard minimum per category
 _MIN_VISIT_DURATION: dict[str, int] = {
-    "coffee": 15,
-    "restaurant": 30,
-    "photo": 5,
+    "coffee": 20,
+    "restaurant": 40,
+    "photo": 10,
     "city": 15,
-    "nature": 15,
+    "nature": 20,
     "hike": 60,
-    "museum": 45,
-    "landmark": 10,
+    "museum": 60,
+    "landmark": 15,
 }
 
 # Scale factors by trip duration
 _DURATION_SCALE: dict[str, float] = {
     "oneHour": 0.6,
     "threeHours": 1.0,
-    "halfDay": 1.15,
-    "fullDay": 1.3,
+    "halfDay": 1.0,
+    "fullDay": 1.0,
 }
+
+# Max stops per category, keyed by duration. Categories not listed = unlimited.
+_CATEGORY_MAX: dict[str, dict[str, int]] = {
+    "coffee":     {"oneHour": 1, "threeHours": 1, "halfDay": 1, "fullDay": 2},
+    "restaurant": {"oneHour": 0, "threeHours": 1, "halfDay": 1, "fullDay": 2},
+    "museum":     {"oneHour": 0, "threeHours": 1, "halfDay": 1, "fullDay": 1},
+}
+
+
+def _get_category_limit(category: str, duration: str, categories: list[str] | None = None) -> int | None:
+    """Return the max allowed stops for a category at a given duration.
+
+    Returns None if no limit applies (unlimited).
+    Special case: if a limited category is the ONLY user-selected category,
+    override 0 limits to 1 so the route is not empty.
+    """
+    limits = _CATEGORY_MAX.get(category)
+    if limits is None:
+        return None
+    limit = limits.get(duration)
+    if limit is None:
+        return None
+    # If limit is 0 but the user selected ONLY this category, allow 1
+    if limit == 0 and categories and len(categories) == 1 and categories[0] == category:
+        return 1
+    return limit
 
 
 def get_visit_duration(category: str, duration: str) -> int:
@@ -134,32 +160,47 @@ def _greedy_select(
     anchor_lng: float,
     pinned_stops: list[SelectedStop] | None,
     use_minimums: bool = False,
+    categories: list[str] | None = None,
 ) -> list[SelectedStop]:
     """Inner greedy loop: pick stops within time budget.
 
     If use_minimums=True, all visit times are set to the category minimum
-    (second-pass fallback for short trips).
+    (second-pass fallback for short trips) and category limits are doubled.
     """
     selected: list[SelectedStop] = list(pinned_stops or [])
     used_ids = {s.place.id for s in selected}
     used_time = sum(s.time_to_spend_minutes for s in selected)
 
+    # Track category counts (including pinned stops)
+    category_count: dict[str, int] = {}
+    for s in selected:
+        cat = s.place.category
+        category_count[cat] = category_count.get(cat, 0) + 1
+
     for place, _ in scored:
         if place.id in used_ids:
             continue
+
+        # Enforce category limits
+        cat_limit = _get_category_limit(place.category, duration, categories)
+        if cat_limit is not None:
+            effective_limit = cat_limit * 2 if use_minimums else cat_limit
+            if category_count.get(place.category, 0) >= effective_limit:
+                continue
 
         if use_minimums:
             visit_time = _MIN_VISIT_DURATION.get(place.category, 5)
         else:
             visit_time = get_visit_duration(place.category, duration)
 
-        # Estimate walk time from last stop (haversine / 4.5 km/h)
+        # Estimate walk time from last stop (haversine * 1.3 / 4.5 km/h)
+        # 1.3x correction: real walking paths are ~30% longer than straight line
         if selected:
             last = selected[-1].place
             dist_m = haversine(last.lat, last.lng, place.lat, place.lng)
         else:
             dist_m = haversine(anchor_lat, anchor_lng, place.lat, place.lng)
-        walk_min = (dist_m / 1000) / 4.5 * 60
+        walk_min = (dist_m * 1.3 / 1000) / 4.5 * 60
 
         # Skip if single walk segment > 90 min (unless hike)
         if walk_min > 90 and place.category != "hike":
@@ -173,6 +214,7 @@ def _greedy_select(
             ))
             used_ids.add(place.id)
             used_time += total_needed
+            category_count[place.category] = category_count.get(place.category, 0) + 1
 
     return selected
 
@@ -212,15 +254,17 @@ def select_stops(
     # First pass: normal durations
     selected = _greedy_select(
         scored, duration, time_budget, anchor_lat, anchor_lng, pinned_stops,
+        categories=categories,
     )
 
     pinned_count = len(pinned_stops or [])
 
     # Second pass: if not enough new stops, retry with minimum durations
+    # (category limits are doubled in minimums pass)
     if len(selected) - pinned_count < 2 and scored:
         selected2 = _greedy_select(
             scored, duration, time_budget, anchor_lat, anchor_lng,
-            pinned_stops, use_minimums=True,
+            pinned_stops, use_minimums=True, categories=categories,
         )
         if len(selected2) > len(selected):
             selected = selected2
@@ -347,6 +391,10 @@ async def generate_adventure(
                     categories=categories if categories else None,
                 )
             )
+            bg_load_task.add_done_callback(
+                lambda t: t.exception() and logger.warning("Background full-radius load failed (non-critical)")
+                if not t.cancelled() else None
+            )
 
     if update_status_fn:
         await update_status_fn("findingPlaces")
@@ -427,12 +475,6 @@ async def generate_adventure(
         selected[0].order = 1
         selected[0].drive_time_minutes = 0
         total_dwell = selected[0].time_to_spend_minutes
-
-        if bg_load_task is not None:
-            try:
-                await bg_load_task
-            except Exception:
-                logger.warning("Background full-radius load failed (non-critical)")
 
         return {
             "stops": [{
@@ -530,12 +572,6 @@ async def generate_adventure(
         selected[0].drive_time_minutes = 0
         total_dwell = selected[0].time_to_spend_minutes
 
-        if bg_load_task is not None:
-            try:
-                await bg_load_task
-            except Exception:
-                logger.warning("Background full-radius load failed (non-critical)")
-
         return {
             "stops": [{
                 "place_id": selected[0].place.id,
@@ -561,13 +597,6 @@ async def generate_adventure(
         }
         for s in selected
     ]
-
-    # Wait for background full-radius load to finish (fire-and-forget cleanup)
-    if bg_load_task is not None:
-        try:
-            await bg_load_task
-        except Exception:
-            logger.warning("Background full-radius load failed (non-critical)")
 
     return {
         "stops": stops_data,
