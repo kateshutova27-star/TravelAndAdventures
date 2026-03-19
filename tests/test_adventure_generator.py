@@ -180,11 +180,17 @@ class TestSelectStops:
             )
 
     def test_repeated_calls_produce_different_stop_sets(self):
-        """Same candidates must yield varied stop selections due to jitter."""
+        """Same candidates must yield varied stop selections due to jitter.
+
+        Uses a larger budget to select more stops, amplifying jitter effect.
+        """
         candidates = _make_candidates(20)
         results: list[tuple[str, ...]] = []
-        for _ in range(20):
-            selected = self._select(candidates=candidates)
+        for _ in range(50):
+            selected = self._select(
+                candidates=candidates,
+                duration="fullDay",  # larger budget → more stops → more jitter impact
+            )
             place_ids = tuple(s.place.id for s in selected)
             results.append(place_ids)
         unique_results = set(results)
@@ -323,13 +329,13 @@ class TestCategoryLimits:
         coffee_count = sum(1 for s in selected if s.place.category == "coffee")
         assert coffee_count <= 1, f"Expected max 1 coffee for threeHours, got {coffee_count}"
 
-    def test_max_two_coffee_full_day(self):
-        """fullDay should have at most 2 coffee stops."""
+    def test_max_one_coffee_full_day(self):
+        """fullDay should have at most 1 coffee stop."""
         candidates = [_make_place(category="coffee", lat=49.28 + i * 0.001, lng=-123.12) for i in range(10)]
         candidates += [_make_place(category="city", lat=49.28 + i * 0.001, lng=-123.11) for i in range(10)]
         selected = self._select(candidates=candidates, duration="fullDay", categories=["coffee", "city"])
         coffee_count = sum(1 for s in selected if s.place.category == "coffee")
-        assert coffee_count <= 2, f"Expected max 2 coffee for fullDay, got {coffee_count}"
+        assert coffee_count <= 1, f"Expected max 1 coffee for fullDay, got {coffee_count}"
 
     def test_no_restaurant_one_hour(self):
         """oneHour with mixed categories should not include restaurant."""
@@ -352,3 +358,77 @@ class TestCategoryLimits:
         selected = self._select(candidates=candidates, duration="fullDay", categories=["nature"])
         nature_count = sum(1 for s in selected if s.place.category == "nature")
         assert nature_count > 2, f"Nature should not be capped, got {nature_count}"
+
+
+class TestHikeMode:
+    """Tests for hike-specific selection logic."""
+
+    def _select(self, *, candidates=None, duration="fullDay", categories=None, **kw):
+        if candidates is None:
+            candidates = _make_candidates(30)
+        return select_stops(
+            candidates=candidates,
+            categories=categories or [],
+            duration=duration,
+            time_budget=DURATION_MINUTES[duration],
+            anchor_lat=49.28,
+            anchor_lng=-123.12,
+            max_radius_m=50000,
+            **kw,
+        )
+
+    def test_hike_absorbs_most_of_budget(self):
+        """A hike stop should get the majority of the time budget."""
+        candidates = [_make_place(category="hike", lat=49.30, lng=-123.10)]
+        candidates += [_make_place(category="nature", lat=49.30 + i * 0.001, lng=-123.10) for i in range(5)]
+        selected = self._select(candidates=candidates, duration="fullDay", categories=["hike", "nature"])
+        hike_stops = [s for s in selected if s.place.category == "hike"]
+        assert len(hike_stops) == 1
+        # Hike should get at least 300 min of a 480 min full day
+        assert hike_stops[0].time_to_spend_minutes >= 300, (
+            f"Hike got {hike_stops[0].time_to_spend_minutes}min, expected >= 300"
+        )
+
+    def test_hike_only_nearby_extras(self):
+        """After a hike is selected, extra stops must be close (< 30 min walk)."""
+        # Hike near anchor
+        candidates = [_make_place(category="hike", lat=49.30, lng=-123.10)]
+        # Close nature (< 1 km from hike)
+        candidates += [_make_place(category="nature", lat=49.301, lng=-123.101, name="Close Nature")]
+        # Far nature (~10 km from hike — >30 min walk)
+        candidates += [_make_place(category="nature", lat=49.38, lng=-123.05, name="Far Nature")]
+        selected = self._select(candidates=candidates, duration="fullDay", categories=["hike", "nature"])
+        names = [s.place.name for s in selected]
+        assert "Far Nature" not in names, "Far stop should be excluded after hike selection"
+
+    def test_hike_single_stop_valid(self):
+        """A single hike stop is a valid fullDay adventure."""
+        # Place hike close to anchor (~2.6km, ~46min walk)
+        candidates = [_make_place(category="hike", lat=49.30, lng=-123.10)]
+        selected = self._select(candidates=candidates, duration="fullDay", categories=["hike"])
+        assert len(selected) == 1
+        assert selected[0].place.category == "hike"
+        # 480min budget - ~46min walk = ~434min for hike
+        assert selected[0].time_to_spend_minutes >= 300, (
+            f"Hike got {selected[0].time_to_spend_minutes}min, expected >= 300"
+        )
+
+    def test_hike_three_hours_still_gets_large_budget(self):
+        """Hike on a 3-hour trip should still absorb most of the budget."""
+        # Place hike close to anchor (~2.6km, ~46min walk)
+        candidates = [_make_place(category="hike", lat=49.30, lng=-123.10)]
+        selected = self._select(candidates=candidates, duration="threeHours", categories=["hike"])
+        assert len(selected) == 1
+        # 180min budget - ~46min walk = ~134min for hike
+        assert selected[0].time_to_spend_minutes >= 100, (
+            f"Hike got {selected[0].time_to_spend_minutes}min on 3h trip"
+        )
+
+    def test_hike_with_close_coffee(self):
+        """A coffee shop right next to a trailhead should be included."""
+        candidates = [_make_place(category="hike", lat=49.30, lng=-123.10)]
+        # Coffee 200m from hike (~3 min walk)
+        candidates += [_make_place(category="coffee", lat=49.3015, lng=-123.10, name="Trailhead Cafe")]
+        selected = self._select(candidates=candidates, duration="fullDay", categories=["hike", "coffee"])
+        names = [s.place.name for s in selected]
+        assert "Trailhead Cafe" in names, "Close coffee should be included with hike"

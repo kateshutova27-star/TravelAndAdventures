@@ -79,8 +79,8 @@ _DURATION_SCALE: dict[str, float] = {
 
 # Max stops per category, keyed by duration. Categories not listed = unlimited.
 _CATEGORY_MAX: dict[str, dict[str, int]] = {
-    "coffee":     {"oneHour": 1, "threeHours": 1, "halfDay": 1, "fullDay": 2},
-    "restaurant": {"oneHour": 0, "threeHours": 1, "halfDay": 1, "fullDay": 2},
+    "coffee":     {"oneHour": 1, "threeHours": 1, "halfDay": 1, "fullDay": 1},
+    "restaurant": {"oneHour": 0, "threeHours": 1, "halfDay": 1, "fullDay": 1},
     "museum":     {"oneHour": 0, "threeHours": 1, "halfDay": 1, "fullDay": 1},
 }
 
@@ -164,12 +164,19 @@ def _greedy_select(
 ) -> list[SelectedStop]:
     """Inner greedy loop: pick stops within time budget.
 
+    Uses adaptive nearest-neighbor: at each step, re-ranks candidates by
+    quality_score / (1 + walk_time/60) to balance quality and reachability.
+
     If use_minimums=True, all visit times are set to the category minimum
     (second-pass fallback for short trips) and category limits are doubled.
+
+    Hike-mode: when a hike is selected, it absorbs the full remaining budget.
+    Additional non-hike stops are only added if walk < 30 min from the hike.
     """
     selected: list[SelectedStop] = list(pinned_stops or [])
     used_ids = {s.place.id for s in selected}
     used_time = sum(s.time_to_spend_minutes for s in selected)
+    has_hike = any(s.place.category == "hike" for s in selected)
 
     # Track category counts (including pinned stops)
     category_count: dict[str, int] = {}
@@ -177,44 +184,126 @@ def _greedy_select(
         cat = s.place.category
         category_count[cat] = category_count.get(cat, 0) + 1
 
-    for place, _ in scored:
-        if place.id in used_ids:
-            continue
+    remaining = list(scored)  # mutable copy
 
-        # Enforce category limits
-        cat_limit = _get_category_limit(place.category, duration, categories)
-        if cat_limit is not None:
-            effective_limit = cat_limit * 2 if use_minimums else cat_limit
-            if category_count.get(place.category, 0) >= effective_limit:
+    # Hike-first strategy: if hike candidates exist and none pinned yet,
+    # pick the best reachable hike first (it absorbs remaining budget),
+    # then fill nearby non-hike stops.
+    if not has_hike and any(p.category == "hike" for p, _ in remaining):
+        cur_lat = selected[-1].place.lat if selected else anchor_lat
+        cur_lng = selected[-1].place.lng if selected else anchor_lng
+        best_hike_idx = -1
+        best_hike_combined = -1.0
+        for i, (place, quality) in enumerate(remaining):
+            if place.category != "hike" or place.id in used_ids:
+                continue
+            dist_m = haversine(cur_lat, cur_lng, place.lat, place.lng)
+            walk_min = (dist_m * 1.3 / 1000) / 4.5 * 60
+            combined = quality / (1.0 + walk_min / 60.0)
+            if combined > best_hike_combined:
+                best_hike_combined = combined
+                best_hike_idx = i
+        if best_hike_idx >= 0:
+            hike_place, _ = remaining.pop(best_hike_idx)
+            dist_m = haversine(cur_lat, cur_lng, hike_place.lat, hike_place.lng)
+            walk_min = (dist_m * 1.3 / 1000) / 4.5 * 60
+            # Reserve time for up to 2 nearby non-hike stops
+            nearby_costs: list[float] = []
+            for p2, _ in remaining:
+                if p2.id in used_ids or p2.category == "hike":
+                    continue
+                d2 = haversine(hike_place.lat, hike_place.lng, p2.lat, p2.lng)
+                w2 = (d2 * 1.3 / 1000) / 4.5 * 60
+                if w2 <= 30:
+                    vt2 = _MIN_VISIT_DURATION.get(p2.category, 5) if use_minimums else get_visit_duration(p2.category, duration)
+                    nearby_costs.append(w2 + vt2)
+            nearby_costs.sort()
+            nearby_reserve = sum(nearby_costs[:2])
+            remaining_budget = time_budget - used_time
+            visit_time = max(
+                int(remaining_budget - walk_min - nearby_reserve),
+                _MIN_VISIT_DURATION["hike"],
+            )
+            selected.append(SelectedStop(place=hike_place, time_to_spend_minutes=visit_time))
+            used_ids.add(hike_place.id)
+            used_time += walk_min + visit_time
+            category_count["hike"] = category_count.get("hike", 0) + 1
+            has_hike = True
+
+    while remaining:
+        cur_lat = selected[-1].place.lat if selected else anchor_lat
+        cur_lng = selected[-1].place.lng if selected else anchor_lng
+        remaining_budget = time_budget - used_time
+
+        if remaining_budget <= 0:
+            break
+
+        # Re-rank: quality weighted by reachability from current position
+        best_idx = -1
+        best_combined = -1.0
+        best_walk = 0.0
+        best_visit = 0
+
+        for i, (place, quality) in enumerate(remaining):
+            if place.id in used_ids:
                 continue
 
-        if use_minimums:
-            visit_time = _MIN_VISIT_DURATION.get(place.category, 5)
-        else:
-            visit_time = get_visit_duration(place.category, duration)
+            # Category limit check
+            cat_limit = _get_category_limit(place.category, duration, categories)
+            if cat_limit is not None:
+                effective_limit = cat_limit * 2 if use_minimums else cat_limit
+                if category_count.get(place.category, 0) >= effective_limit:
+                    continue
 
-        # Estimate walk time from last stop (haversine * 1.3 / 4.5 km/h)
-        # 1.3x correction: real walking paths are ~30% longer than straight line
-        if selected:
-            last = selected[-1].place
-            dist_m = haversine(last.lat, last.lng, place.lat, place.lng)
-        else:
-            dist_m = haversine(anchor_lat, anchor_lng, place.lat, place.lng)
-        walk_min = (dist_m * 1.3 / 1000) / 4.5 * 60
+            dist_m = haversine(cur_lat, cur_lng, place.lat, place.lng)
+            walk_min = (dist_m * 1.3 / 1000) / 4.5 * 60
 
-        # Skip if single walk segment > 90 min (unless hike)
-        if walk_min > 90 and place.category != "hike":
-            continue
+            # After hike: only nearby non-hike stops
+            if has_hike and place.category != "hike" and walk_min > 30:
+                continue
 
-        total_needed = walk_min + visit_time
-        if used_time + total_needed <= time_budget:
-            selected.append(SelectedStop(
-                place=place,
-                time_to_spend_minutes=visit_time,
-            ))
-            used_ids.add(place.id)
-            used_time += total_needed
-            category_count[place.category] = category_count.get(place.category, 0) + 1
+            # Dynamic walk cap: max(90, 40% of remaining budget)
+            max_walk = max(90, remaining_budget * 0.4)
+            if walk_min > max_walk and place.category != "hike":
+                continue
+
+            # Visit time
+            if place.category == "hike":
+                visit_time = max(
+                    int(remaining_budget - walk_min),
+                    _MIN_VISIT_DURATION["hike"],
+                )
+            elif use_minimums:
+                visit_time = _MIN_VISIT_DURATION.get(place.category, 5)
+            else:
+                visit_time = get_visit_duration(place.category, duration)
+
+            total_needed = walk_min + visit_time
+            if used_time + total_needed > time_budget:
+                continue
+
+            # Combined score: quality weighted by reachability
+            # Closer places score higher via 1/(1 + walk/60)
+            combined = quality / (1.0 + walk_min / 60.0)
+            if combined > best_combined:
+                best_combined = combined
+                best_idx = i
+                best_walk = walk_min
+                best_visit = visit_time
+
+        if best_idx < 0:
+            break
+
+        place, _ = remaining.pop(best_idx)
+        selected.append(SelectedStop(
+            place=place,
+            time_to_spend_minutes=best_visit,
+        ))
+        used_ids.add(place.id)
+        used_time += best_walk + best_visit
+        category_count[place.category] = category_count.get(place.category, 0) + 1
+        if place.category == "hike":
+            has_hike = True
 
     return selected
 
@@ -295,6 +384,33 @@ def _validate_time_budget(
     return total_time <= budget
 
 
+async def _find_candidates_by_categories(
+    db: AsyncSession,
+    lat: float,
+    lng: float,
+    radius_m: float,
+    categories: list[str],
+    limit_per_cat: int = 30,
+) -> list[Place]:
+    """Fetch candidates per requested category to avoid popular categories
+    crowding out rare ones (e.g. restaurants pushing out hikes).
+
+    If no categories specified, fetch all with a larger limit.
+    """
+    if not categories:
+        return await find_nearby(db, lat, lng, radius_m=radius_m, limit=200)
+
+    seen_ids: set = set()
+    all_places: list[Place] = []
+    for cat in categories:
+        places = await find_nearby(db, lat, lng, radius_m=radius_m, category=cat, limit=limit_per_cat)
+        for p in places:
+            if p.id not in seen_ids:
+                seen_ids.add(p.id)
+                all_places.append(p)
+    return all_places
+
+
 async def generate_adventure(
     db: AsyncSession,
     lat: float,
@@ -356,7 +472,11 @@ async def generate_adventure(
     if update_status_fn:
         await update_status_fn("findingPlaces")
 
-    all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m, limit=100)
+    # Fetch per-category to avoid popular categories (restaurant/coffee)
+    # crowding out rare ones (hike, museum) due to rating-based LIMIT.
+    all_candidates = await _find_candidates_by_categories(
+        db, anchor_lat, anchor_lng, radius_m, categories, limit_per_cat=30,
+    )
 
     # Only fetch from Overpass if not enough candidates in DB
     bg_load_task = None
@@ -370,7 +490,9 @@ async def generate_adventure(
             radius_km=core_radius,
             categories=categories if categories else None,
         )
-        all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m, limit=100)
+        all_candidates = await _find_candidates_by_categories(
+            db, anchor_lat, anchor_lng, radius_m, categories, limit_per_cat=30,
+        )
 
         # Still not enough? Try a wider Overpass fetch
         if len(all_candidates) < config.min_stops:
@@ -379,7 +501,9 @@ async def generate_adventure(
                 radius_km=min(search_radius_km, 2.0),
                 categories=categories if categories else None,
             )
-            all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m, limit=100)
+            all_candidates = await _find_candidates_by_categories(
+                db, anchor_lat, anchor_lng, radius_m, categories, limit_per_cat=30,
+            )
 
     # Background: load full radius for future requests
     if redis is not None:
@@ -401,9 +525,13 @@ async def generate_adventure(
 
     # Expand radius from DB if still not enough
     if len(all_candidates) < config.min_stops:
-        all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m * 2, limit=100)
+        all_candidates = await _find_candidates_by_categories(
+            db, anchor_lat, anchor_lng, radius_m * 2, categories, limit_per_cat=30,
+        )
     if len(all_candidates) < config.min_stops:
-        all_candidates = await find_nearby(db, anchor_lat, anchor_lng, radius_m=radius_m * 3, limit=100)
+        all_candidates = await _find_candidates_by_categories(
+            db, anchor_lat, anchor_lng, radius_m * 3, categories, limit_per_cat=30,
+        )
 
     # Filter out excluded places (disliked, recently visited)
     excluded_set = set(excluded_place_ids or [])
