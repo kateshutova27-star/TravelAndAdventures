@@ -83,12 +83,30 @@ async def list_places(
     # Fetch from DB (may be empty on first request; will populate on next request)
     if q:
         places = await place_service.search_places(db, q, lat, lng, radius, limit=limit)
-    else:
+    elif category:
         places = await place_service.find_nearby(
             db, lat, lng, radius_m=radius,
-            category=category.value if category else None,
+            category=category.value,
             limit=limit,
         )
+    else:
+        # "All" mode: fetch per-category to prevent popular categories
+        # (restaurant, coffee) from crowding out rare ones (hike, museum)
+        all_cats = [c.value for c in PlaceCategory]
+        per_cat = max(limit // len(all_cats), 10)
+        seen_ids: set = set()
+        places = []
+        for cat in all_cats:
+            cat_places = await place_service.find_nearby(
+                db, lat, lng, radius_m=radius,
+                category=cat, limit=per_cat,
+            )
+            for p in cat_places:
+                if p.id not in seen_ids:
+                    seen_ids.add(p.id)
+                    places.append(p)
+        # Sort combined results by rating
+        places.sort(key=lambda p: -(p.rating or 0))
 
     responses = [_place_to_response(p) for p in places]
 

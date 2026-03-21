@@ -50,7 +50,7 @@ _BASE_VISIT_DURATION: dict[str, int] = {
     "coffee": 30,
     "restaurant": 60,
     "photo": 15,
-    "city": 40,
+    "city": 20,
     "nature": 45,
     "hike": 120,
     "museum": 120,
@@ -168,7 +168,7 @@ def _greedy_select(
     quality_score / (1 + walk_time/60) to balance quality and reachability.
 
     If use_minimums=True, all visit times are set to the category minimum
-    (second-pass fallback for short trips) and category limits are doubled.
+    (second-pass fallback for short trips).
 
     Hike-mode: when a hike is selected, it absorbs the full remaining budget.
     Additional non-hike stops are only added if walk < 30 min from the hike.
@@ -186,23 +186,62 @@ def _greedy_select(
 
     remaining = list(scored)  # mutable copy
 
+    # Category diversity: when multiple categories are selected, seed one
+    # stop per category first to guarantee representation.
+    # Skip when hike is requested — hike-first strategy handles it.
+    has_hike_candidate = any(p.category == "hike" for p, _ in remaining)
+    if categories and len(categories) > 1 and not has_hike and not has_hike_candidate:
+        represented = set(category_count.keys())
+        for cat in categories:
+            if cat in represented or cat == "hike":
+                continue
+            cur_lat = selected[-1].place.lat if selected else anchor_lat
+            cur_lng = selected[-1].place.lng if selected else anchor_lng
+            best_idx = -1
+            best_combined = -1.0
+            for i, (place, quality) in enumerate(remaining):
+                if place.id in used_ids or place.category != cat:
+                    continue
+                cat_limit = _get_category_limit(cat, duration, categories)
+                if cat_limit is not None and cat_limit == 0:
+                    continue
+                dist_m = haversine(cur_lat, cur_lng, place.lat, place.lng)
+                walk_min = (dist_m * 1.3 / 1000) / 4.5 * 60
+                visit_time = _MIN_VISIT_DURATION.get(cat, 5) if use_minimums else get_visit_duration(cat, duration)
+                if used_time + walk_min + visit_time > time_budget:
+                    continue
+                combined = quality / (1.0 + walk_min / 60.0)
+                if combined > best_combined:
+                    best_combined = combined
+                    best_idx = i
+            if best_idx >= 0:
+                place, _ = remaining.pop(best_idx)
+                dist_m = haversine(cur_lat, cur_lng, place.lat, place.lng)
+                walk_min = (dist_m * 1.3 / 1000) / 4.5 * 60
+                visit_time = _MIN_VISIT_DURATION.get(place.category, 5) if use_minimums else get_visit_duration(place.category, duration)
+                selected.append(SelectedStop(place=place, time_to_spend_minutes=visit_time))
+                used_ids.add(place.id)
+                used_time += walk_min + visit_time
+                category_count[place.category] = category_count.get(place.category, 0) + 1
+                represented.add(cat)
+
     # Hike-first strategy: if hike candidates exist and none pinned yet,
     # pick the best reachable hike first (it absorbs remaining budget),
     # then fill nearby non-hike stops.
     if not has_hike and any(p.category == "hike" for p, _ in remaining):
         cur_lat = selected[-1].place.lat if selected else anchor_lat
         cur_lng = selected[-1].place.lng if selected else anchor_lng
-        best_hike_idx = -1
-        best_hike_combined = -1.0
+        hike_options: list[tuple[int, float]] = []
         for i, (place, quality) in enumerate(remaining):
             if place.category != "hike" or place.id in used_ids:
                 continue
             dist_m = haversine(cur_lat, cur_lng, place.lat, place.lng)
             walk_min = (dist_m * 1.3 / 1000) / 4.5 * 60
             combined = quality / (1.0 + walk_min / 60.0)
-            if combined > best_hike_combined:
-                best_hike_combined = combined
-                best_hike_idx = i
+            hike_options.append((i, combined))
+        hike_options.sort(key=lambda x: x[1], reverse=True)
+        top_n = min(3, len(hike_options))
+        best_hike_idx = random.choice(hike_options[:top_n])[0] if hike_options else -1
         if best_hike_idx >= 0:
             hike_place, _ = remaining.pop(best_hike_idx)
             dist_m = haversine(cur_lat, cur_lng, hike_place.lat, hike_place.lng)
@@ -248,11 +287,10 @@ def _greedy_select(
             if place.id in used_ids:
                 continue
 
-            # Category limit check
+            # Category limit check (same limits in both passes)
             cat_limit = _get_category_limit(place.category, duration, categories)
             if cat_limit is not None:
-                effective_limit = cat_limit * 2 if use_minimums else cat_limit
-                if category_count.get(place.category, 0) >= effective_limit:
+                if category_count.get(place.category, 0) >= cat_limit:
                     continue
 
             dist_m = haversine(cur_lat, cur_lng, place.lat, place.lng)
@@ -349,7 +387,6 @@ def select_stops(
     pinned_count = len(pinned_stops or [])
 
     # Second pass: if not enough new stops, retry with minimum durations
-    # (category limits are doubled in minimums pass)
     if len(selected) - pinned_count < 2 and scored:
         selected2 = _greedy_select(
             scored, duration, time_budget, anchor_lat, anchor_lng,

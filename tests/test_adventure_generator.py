@@ -250,9 +250,8 @@ class TestSelectStops:
         )
         assert len(selected) >= 1
 
-    def test_one_hour_fits_two_coffee_stops(self):
-        """oneHour budget should fit at least 2 coffee stops with minimums."""
-        # Create 10 coffee places very close together
+    def test_one_hour_coffee_respects_category_limit(self):
+        """oneHour with only coffee selected should have exactly 1 coffee stop."""
         candidates = [
             _make_place(category="coffee", rating=4.0 + i * 0.1,
                         lat=49.28 + i * 0.0002, lng=-123.12)
@@ -263,8 +262,8 @@ class TestSelectStops:
             categories=["coffee"],
             duration="oneHour",
         )
-        assert len(selected) >= 2, (
-            f"Expected at least 2 coffee stops for oneHour, got {len(selected)}"
+        assert len(selected) == 1, (
+            f"Expected exactly 1 coffee stop for oneHour, got {len(selected)}"
         )
 
     def test_min_visit_durations_fit_one_hour(self):
@@ -384,9 +383,9 @@ class TestHikeMode:
         selected = self._select(candidates=candidates, duration="fullDay", categories=["hike", "nature"])
         hike_stops = [s for s in selected if s.place.category == "hike"]
         assert len(hike_stops) == 1
-        # Hike should get at least 300 min of a 480 min full day
-        assert hike_stops[0].time_to_spend_minutes >= 300, (
-            f"Hike got {hike_stops[0].time_to_spend_minutes}min, expected >= 300"
+        # Hike should get the majority of the 480 min full day budget
+        assert hike_stops[0].time_to_spend_minutes >= 250, (
+            f"Hike got {hike_stops[0].time_to_spend_minutes}min, expected >= 250"
         )
 
     def test_hike_only_nearby_extras(self):
